@@ -1266,73 +1266,1059 @@ async function loadGitHubMedia() {
   return { total, music: musicPlaylist.length };
 }
 
+<!-- =========================================================
+     BACKGROUND MUSIC
+     ========================================================= -->
 
-/* --- CONTINUOUS MUSIC PLAYER --- */
-// Music is deliberately independent of GitHub photo discovery.
-const MUSIC_FILES = [
-  'music/Cigarettes After Sex - Apocalypse (Long Version) (1).mp3'
-];
+<audio id="bg-audio" preload="auto"></audio>
 
-let musicPlaylist = MUSIC_FILES.map(path => ({
-  name: path.split('/').pop(),
-  url: new URL(path.split('/').map(encodeURIComponent).join('/'), document.baseURI).href
-}));
+<script>
+/* =========================================================
+   GITHUB SCRAPBOOK MUSIC SYSTEM
+   =========================================================
+
+   HOW IT WORKS:
+
+   1. The /music/ folder in your GitHub repository is scanned.
+   2. Every supported audio file is automatically detected.
+   3. Files are sorted alphabetically.
+   4. Songs play continuously one after another.
+   5. If there is only one song, it automatically repeats.
+   6. No filenames need to be manually added here.
+
+   Supported:
+   .mp3
+   .wav
+   .m4a
+   .ogg
+   .aac
+   .flac
+
+   ========================================================= */
+
+
+/* ---------------------------------------------------------
+   SUPPORTED AUDIO EXTENSIONS
+   --------------------------------------------------------- */
+
+const AUDIO_EXTENSIONS = new Set([
+    '.mp3',
+    '.wav',
+    '.m4a',
+    '.ogg',
+    '.aac',
+    '.flac'
+]);
+
+
+/* ---------------------------------------------------------
+   CURRENT MUSIC STATE
+   --------------------------------------------------------- */
+
+let musicPlaylist = [];
 
 let currentTrackIndex = 0;
+
 let isAudioPlaying = false;
+
 let isMuted = false;
 
-function startMusicPlayer() {
-  const audio = document.getElementById('bg-audio');
-  if (!audio || !musicPlaylist.length || isMuted) return;
 
-  const track = musicPlaylist[currentTrackIndex];
-  audio.src = track.url;
-  audio.loop = true;
+/* ---------------------------------------------------------
+   FALLBACK TRACK
+   ---------------------------------------------------------
 
-  // Called directly by the book's click handler, so this remains in the
-  // browser's user-gesture context. A music failure never affects the book.
-  audio.play().then(() => {
-    isAudioPlaying = true;
-    const ui = document.getElementById('music-ui');
-    if (ui) ui.classList.remove('muted');
-  }).catch(err => {
-    isAudioPlaying = false;
-    console.warn('Background music could not start:', err);
-  });
+   This is ONLY used if the GitHub API has not finished
+   loading the music folder yet.
+
+   It means clicking the book can start music immediately
+   without waiting for the GitHub folder scan.
+
+   Once GitHub finishes loading, musicPlaylist is replaced
+   with the complete list from /music/.
+   --------------------------------------------------------- */
+
+const FALLBACK_MUSIC_FILE =
+    'music/Cigarettes After Sex - Apocalypse (Long Version) (1).mp3';
+
+
+const FALLBACK_MUSIC_TRACK = {
+    name: FALLBACK_MUSIC_FILE.split('/').pop(),
+
+    url: new URL(
+        FALLBACK_MUSIC_FILE
+            .split('/')
+            .map(part => encodeURIComponent(part))
+            .join('/'),
+        document.baseURI
+    ).href
+};
+
+
+/* ---------------------------------------------------------
+   FILE HELPERS
+   --------------------------------------------------------- */
+
+function getFileExtension(path) {
+
+    if (!path) return '';
+
+    const cleanPath = path
+        .split('?')[0]
+        .split('#')[0];
+
+    const dot = cleanPath.lastIndexOf('.');
+
+    if (dot === -1) return '';
+
+    return cleanPath
+        .slice(dot)
+        .toLowerCase();
 }
+
+
+function getFileName(path) {
+
+    if (!path) return '';
+
+    const parts = path.split('/');
+
+    return parts[parts.length - 1];
+}
+
+
+/* ---------------------------------------------------------
+   GITHUB SITE INFORMATION
+   --------------------------------------------------------- */
+
+function getGitHubSiteInfo() {
+
+    const hostname = window.location.hostname;
+
+    const pathname = window.location.pathname;
+
+    /*
+       Example:
+
+       ashishkumar3901-dot.github.io
+       /PALAK-SCRAPBOOK/
+
+       becomes:
+
+       owner = ashishkumar3901-dot
+       repo  = PALAK-SCRAPBOOK
+    */
+
+    if (!hostname.endsWith('.github.io')) {
+        return null;
+    }
+
+    const owner = hostname
+        .replace('.github.io', '');
+
+    const pathParts = pathname
+        .split('/')
+        .filter(Boolean);
+
+    if (!pathParts.length) {
+        return null;
+    }
+
+    const repo = pathParts[0];
+
+    return {
+        owner: owner,
+        repo: repo
+    };
+}
+
+
+/* ---------------------------------------------------------
+   GET DEFAULT GITHUB BRANCH
+   --------------------------------------------------------- */
+
+async function getGitHubDefaultBranch(owner, repo) {
+
+    const url =
+        'https://api.github.com/repos/' +
+        encodeURIComponent(owner) +
+        '/' +
+        encodeURIComponent(repo);
+
+    const response = await fetch(url, {
+        headers: {
+            'Accept': 'application/vnd.github+json'
+        }
+    });
+
+    if (!response.ok) {
+
+        throw new Error(
+            'Could not read GitHub repository information. HTTP ' +
+            response.status
+        );
+    }
+
+    const data = await response.json();
+
+    return data.default_branch || 'main';
+}
+
+
+/* ---------------------------------------------------------
+   CREATE RAW GITHUB MEDIA URL
+   --------------------------------------------------------- */
+
+function createGitHubMediaURL(
+    path,
+    owner,
+    repo,
+    branch
+) {
+
+    const encodedPath = path
+        .split('/')
+        .map(part => encodeURIComponent(part))
+        .join('/');
+
+    return (
+        'https://raw.githubusercontent.com/' +
+        encodeURIComponent(owner) +
+        '/' +
+        encodeURIComponent(repo) +
+        '/' +
+        encodeURIComponent(branch) +
+        '/' +
+        encodedPath
+    );
+}
+
+
+/* ---------------------------------------------------------
+   BUILD MUSIC PLAYLIST FROM GITHUB TREE
+   ---------------------------------------------------------
+
+   This is the important part.
+
+   We DO NOT hardcode the song names.
+
+   GitHub gives us the complete repository tree.
+
+   We then keep only:
+
+       music/anything.mp3
+       music/song.wav
+       music/my_song.m4a
+       etc.
+
+   Nested folders are also supported:
+
+       music/chill/song.mp3
+       music/favourites/song2.wav
+
+   --------------------------------------------------------- */
+
+function buildMusicPlaylistFromGitHubTree(
+    tree,
+    owner,
+    repo,
+    branch
+) {
+
+    if (!Array.isArray(tree)) {
+        return [];
+    }
+
+    return tree
+
+        /* Only actual files */
+        .filter(function(entry) {
+
+            return (
+                entry &&
+                entry.type === 'blob' &&
+                entry.path
+            );
+
+        })
+
+        /* Only files inside /music/ */
+        .filter(function(entry) {
+
+            const path = entry.path
+                .replace(/\\/g, '/');
+
+            const firstFolder =
+                path.split('/')[0]
+                    .toLowerCase();
+
+            return firstFolder === 'music';
+
+        })
+
+        /* Only supported audio files */
+        .filter(function(entry) {
+
+            return AUDIO_EXTENSIONS.has(
+                getFileExtension(entry.path)
+            );
+
+        })
+
+        /* Consistent alphabetical order */
+        .sort(function(a, b) {
+
+            return a.path.localeCompare(
+                b.path,
+                undefined,
+                {
+                    numeric: true,
+                    sensitivity: 'base'
+                }
+            );
+
+        })
+
+        /* Convert GitHub entries to playable tracks */
+        .map(function(entry) {
+
+            const cleanPath =
+                entry.path
+                    .replace(/\\/g, '/');
+
+            return {
+
+                name: getFileName(cleanPath),
+
+                path: cleanPath,
+
+                url: createGitHubMediaURL(
+                    cleanPath,
+                    owner,
+                    repo,
+                    branch
+                )
+
+            };
+
+        });
+}
+
+
+/* ---------------------------------------------------------
+   LOAD MUSIC FROM GITHUB
+   --------------------------------------------------------- */
+
+async function loadMusicFromGitHub() {
+
+    const siteInfo =
+        getGitHubSiteInfo();
+
+    if (!siteInfo) {
+
+        console.warn(
+            'Not running on GitHub Pages. Using fallback music.'
+        );
+
+        return [];
+
+    }
+
+
+    const owner =
+        siteInfo.owner;
+
+    const repo =
+        siteInfo.repo;
+
+
+    try {
+
+        const branch =
+            await getGitHubDefaultBranch(
+                owner,
+                repo
+            );
+
+
+        const treeURL =
+            'https://api.github.com/repos/' +
+            encodeURIComponent(owner) +
+            '/' +
+            encodeURIComponent(repo) +
+            '/git/trees/' +
+            encodeURIComponent(branch) +
+            '?recursive=1';
+
+
+        const response =
+            await fetch(treeURL, {
+                headers: {
+                    'Accept':
+                        'application/vnd.github+json'
+                }
+            });
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                'GitHub tree request failed. HTTP ' +
+                response.status
+            );
+
+        }
+
+
+        const data =
+            await response.json();
+
+
+        const playlist =
+            buildMusicPlaylistFromGitHubTree(
+                data.tree || [],
+                owner,
+                repo,
+                branch
+            );
+
+
+        if (playlist.length > 0) {
+
+            musicPlaylist = playlist;
+
+            /*
+               Make sure the current index is valid
+               after the playlist has been replaced.
+            */
+
+            if (
+                currentTrackIndex >=
+                musicPlaylist.length
+            ) {
+
+                currentTrackIndex = 0;
+
+            }
+
+
+            console.log(
+                '🎵 GitHub music loaded:',
+                musicPlaylist.map(
+                    track => track.name
+                )
+            );
+
+        } else {
+
+            console.warn(
+                'No supported audio files found in /music/. ' +
+                'Using fallback track.'
+            );
+
+        }
+
+
+        return musicPlaylist;
+
+    } catch (error) {
+
+        console.warn(
+            'Could not load GitHub music folder:',
+            error
+        );
+
+        /*
+           IMPORTANT:
+
+           Do not break the scrapbook if the GitHub API
+           temporarily fails.
+
+           The fallback song remains available.
+        */
+
+        return [];
+
+    }
+}
+
+
+/* ---------------------------------------------------------
+   GET CURRENT PLAYBACK PLAYLIST
+   --------------------------------------------------------- */
+
+function getPlaybackPlaylist() {
+
+    /*
+       If GitHub has successfully detected songs,
+       use the real playlist.
+
+       Otherwise use the fallback song.
+    */
+
+    if (
+        Array.isArray(musicPlaylist) &&
+        musicPlaylist.length > 0
+    ) {
+
+        return musicPlaylist;
+
+    }
+
+
+    return [FALLBACK_MUSIC_TRACK];
+}
+
+
+/* ---------------------------------------------------------
+   START MUSIC
+   ---------------------------------------------------------
+
+   This function is called directly from the BOOK CLICK.
+
+   Therefore the first play() happens in the user's
+   click interaction and has the best chance of passing
+   browser autoplay restrictions.
+   --------------------------------------------------------- */
+
+function startMusicPlayer() {
+
+    const audio =
+        document.getElementById('bg-audio');
+
+
+    if (!audio) {
+
+        console.warn(
+            'Background audio element not found.'
+        );
+
+        return;
+
+    }
+
+
+    if (isMuted) {
+        return;
+    }
+
+
+    const playlist =
+        getPlaybackPlaylist();
+
+
+    if (!playlist.length) {
+        return;
+    }
+
+
+    /*
+       Protect against an invalid index.
+    */
+
+    if (
+        currentTrackIndex < 0 ||
+        currentTrackIndex >= playlist.length
+    ) {
+
+        currentTrackIndex = 0;
+
+    }
+
+
+    const track =
+        playlist[currentTrackIndex];
+
+
+    if (!track || !track.url) {
+
+        console.warn(
+            'Invalid music track.'
+        );
+
+        return;
+
+    }
+
+
+    /*
+       IMPORTANT:
+
+       Do NOT use audio.loop = true here.
+
+       If loop is true, the browser never fires
+       the normal "ended" event for moving to the
+       next song.
+
+       We control looping ourselves.
+    */
+
+    audio.loop = false;
+
+
+    /*
+       Only change the source when necessary.
+
+       This prevents unnecessary reloads.
+    */
+
+    if (
+        audio.src !== track.url
+    ) {
+
+        audio.src = track.url;
+
+        /*
+           Explicit load makes browser behaviour
+           more consistent after changing tracks.
+        */
+
+        try {
+            audio.load();
+        } catch (error) {
+            console.warn(
+                'Audio load warning:',
+                error
+            );
+        }
+
+    }
+
+
+    /*
+       PLAY
+
+       This is intentionally NOT wrapped in an
+       asynchronous delay.
+    */
+
+    const playPromise =
+        audio.play();
+
+
+    if (
+        playPromise &&
+        typeof playPromise.then === 'function'
+    ) {
+
+        playPromise
+
+            .then(function() {
+
+                isAudioPlaying = true;
+
+                const ui =
+                    document.getElementById(
+                        'music-ui'
+                    );
+
+                if (ui) {
+
+                    ui.classList.remove(
+                        'muted'
+                    );
+
+                }
+
+
+                console.log(
+                    '🎵 Playing:',
+                    track.name
+                );
+
+            })
+
+            .catch(function(error) {
+
+                isAudioPlaying = false;
+
+                /*
+                   Autoplay restrictions are normal
+                   browser behaviour.
+
+                   Most importantly, this error does
+                   NOT affect the scrapbook or book.
+                */
+
+                console.warn(
+                    'Background music could not start:',
+                    error
+                );
+
+            });
+
+    }
+
+}
+
+
+/* ---------------------------------------------------------
+   PLAY NEXT TRACK
+   --------------------------------------------------------- */
 
 function playNextTrack() {
-  if (!musicPlaylist.length) return;
-  currentTrackIndex = (currentTrackIndex + 1) % musicPlaylist.length;
-  startMusicPlayer();
+
+    const playlist =
+        getPlaybackPlaylist();
+
+
+    if (!playlist.length) {
+        return;
+    }
+
+
+    /*
+       Move to next song.
+
+       Example:
+
+       Song 1
+       Song 2
+       Song 3
+       Song 1
+       Song 2
+       ...
+
+    */
+
+    currentTrackIndex =
+        (currentTrackIndex + 1) %
+        playlist.length;
+
+
+    startMusicPlayer();
+
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  const audio = document.getElementById('bg-audio');
-  if (!audio) return;
-  audio.onended = () => playNextTrack();
-  audio.onerror = () => {
-    isAudioPlaying = false;
-    console.warn('Background music file could not be loaded:', audio.currentSrc || audio.src);
-  };
-});
+
+/* ---------------------------------------------------------
+   PLAY PREVIOUS TRACK
+   ---------------------------------------------------------
+
+   Optional helper.
+
+   Your existing scrapbook does not need to call this,
+   but it is available if you later want a previous-song
+   button.
+   --------------------------------------------------------- */
+
+function playPreviousTrack() {
+
+    const playlist =
+        getPlaybackPlaylist();
+
+
+    if (!playlist.length) {
+        return;
+    }
+
+
+    currentTrackIndex =
+        (
+            currentTrackIndex -
+            1 +
+            playlist.length
+        ) %
+        playlist.length;
+
+
+    startMusicPlayer();
+
+}
+
+
+/* ---------------------------------------------------------
+   TOGGLE MUTE
+   --------------------------------------------------------- */
 
 function toggleMute() {
-  const audio = document.getElementById('bg-audio');
-  const ui = document.getElementById('music-ui');
-  if (!audio) return;
 
-  isMuted = !isMuted;
-  if (isMuted) {
-    audio.pause();
-    isAudioPlaying = false;
-    if (ui) ui.classList.add('muted');
-  } else {
-    if (ui) ui.classList.remove('muted');
-    startMusicPlayer();
-  }
+    const audio =
+        document.getElementById('bg-audio');
+
+    const ui =
+        document.getElementById('music-ui');
+
+
+    if (!audio) {
+        return;
+    }
+
+
+    isMuted =
+        !isMuted;
+
+
+    if (isMuted) {
+
+        audio.pause();
+
+        isAudioPlaying = false;
+
+
+        if (ui) {
+
+            ui.classList.add(
+                'muted'
+            );
+
+        }
+
+
+        console.log(
+            '🔇 Music muted'
+        );
+
+    } else {
+
+        if (ui) {
+
+            ui.classList.remove(
+                'muted'
+            );
+
+        }
+
+
+        startMusicPlayer();
+
+
+        console.log(
+            '🔊 Music unmuted'
+        );
+
+    }
+
 }
+
+
+/* ---------------------------------------------------------
+   AUDIO EVENTS
+   --------------------------------------------------------- */
+
+document.addEventListener(
+    'DOMContentLoaded',
+    function() {
+
+        const audio =
+            document.getElementById(
+                'bg-audio'
+            );
+
+
+        if (!audio) {
+            return;
+        }
+
+
+        /*
+           When a song finishes:
+
+           - If there are multiple songs,
+             move to the next song.
+
+           - If there is only one song,
+             currentTrackIndex becomes 0 again
+             and the same song starts again.
+        */
+
+        audio.addEventListener(
+            'ended',
+            function() {
+
+                isAudioPlaying = false;
+
+                playNextTrack();
+
+            }
+        );
+
+
+        /*
+           Handle broken/missing files without
+           breaking anything else.
+        */
+
+        audio.addEventListener(
+            'error',
+            function() {
+
+                isAudioPlaying = false;
+
+                console.warn(
+                    '🎵 Music file could not be loaded:',
+                    audio.currentSrc ||
+                    audio.src
+                );
+
+            }
+        );
+
+
+        /*
+           Keep state accurate.
+        */
+
+        audio.addEventListener(
+            'play',
+            function() {
+
+                isAudioPlaying = true;
+
+            }
+        );
+
+
+        audio.addEventListener(
+            'pause',
+            function() {
+
+                /*
+                   Do not mark it as stopped if the
+                   pause is happening because the song
+                   naturally ended.
+
+                   The ended handler handles that.
+                */
+
+                if (!audio.ended) {
+
+                    isAudioPlaying = false;
+
+                }
+
+            }
+        );
+
+    }
+);
+
+
+/* ---------------------------------------------------------
+   AUTOMATIC GITHUB MUSIC DISCOVERY
+   ---------------------------------------------------------
+
+   This runs after the page loads.
+
+   It means you can simply upload:
+
+       /music/song1.mp3
+       /music/song2.mp3
+       /music/song3.wav
+       /music/song4.m4a
+
+   to GitHub.
+
+   You DO NOT edit this HTML again.
+
+   --------------------------------------------------------- */
+
+async function initializeGitHubMusic() {
+
+    try {
+
+        await loadMusicFromGitHub();
+
+
+        /*
+           If the book has already been opened and
+           the fallback song failed to start, give the
+           detected playlist another chance.
+
+           We deliberately do not force a new play
+           if music is already playing.
+        */
+
+        const audio =
+            document.getElementById(
+                'bg-audio'
+            );
+
+
+        if (
+            audio &&
+            !isAudioPlaying &&
+            !isMuted
+        ) {
+
+            /*
+               Only attempt this if the audio element
+               already has interaction with the scrapbook.
+
+               Otherwise we avoid triggering autoplay
+               unexpectedly on page load.
+            */
+
+            if (
+                audio.src &&
+                audio.currentTime >= 0
+            ) {
+
+                /*
+                   Do not force autoplay here.
+                   The user's book click remains the
+                   authoritative music-start action.
+                */
+
+            }
+
+        }
+
+    } catch (error) {
+
+        console.warn(
+            'GitHub music initialization failed:',
+            error
+        );
+
+    }
+
+}
+
+
+/* ---------------------------------------------------------
+   START GITHUB MUSIC DISCOVERY AFTER DOM LOAD
+   --------------------------------------------------------- */
+
+window.addEventListener(
+    'load',
+    function() {
+
+        initializeGitHubMusic();
+
+    }
+);
+
+
+/* =========================================================
+   IMPORTANT BOOK CLICK INTEGRATION
+   =========================================================
+
+   Your existing BOOK onclick should remain:
+
+       if (typeof window.startMusicPlayer === 'function')
+           window.startMusicPlayer();
+
+   Example:
+
+   <div id="book-3d" onclick="
+       document.getElementById('book-cover')?.classList.add('open');
+
+       setTimeout(function(){
+           document.getElementById('book-stage')?.classList.add('gone');
+           document.getElementById('chapnav')?.classList.add('show');
+           document.getElementById('music-ui')?.classList.add('show');
+       }, 1200);
+
+       if (typeof window.startMusicPlayer === 'function')
+           window.startMusicPlayer();
+   ">
+
+   DO NOT remove that call.
+
+   ========================================================= */
+</script>
+
 
 /* --- CAPTION GENERATION & HELPER FUNCTIONS --- */
 const CUTE_CAPTIONS = {
